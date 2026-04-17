@@ -27,10 +27,26 @@ from sklearn.model_selection import train_test_split
 
 from pathlib import Path
 
-LABEL_ORDER = ["pen", "paper", "book", "clock", "phone", "laptop", "chair", "desk", "bottle", "keychain", "backpack", "calculator"]
+LABEL_ORDER = [
+    "pen",
+    "paper",
+    "book",
+    "clock",
+    "phone",
+    "laptop",
+    "chair",
+    "desk",
+    "bottle",
+    "keychain",
+    "backpack",
+    "calculator",
+]
 VALID_LABELS = set(LABEL_ORDER)
 LABEL_TO_IDX = {label: i for i, label in enumerate(LABEL_ORDER)}
 IMG_RE = re.compile(r"^img(\S+)\.png$", re.IGNORECASE)
+SEED = 42
+
+
 def load_data(directory):
     starting_point = Path(directory)
     data = []
@@ -40,7 +56,7 @@ def load_data(directory):
         if not subdir.is_dir():
             print(f"Skipping {subdir} because it is not a directory.")
             continue
-        subdir_labels = subdir.name.split('_')
+        subdir_labels = subdir.name.split("_")
         if not all(label in VALID_LABELS for label in subdir_labels):
             print(f"Skipping directory {subdir} due to invalid labels: {subdir_labels}")
             continue
@@ -55,16 +71,52 @@ def load_data(directory):
                     img_path = img_file.resolve()
                     img = read_image(str(img_path))
                     if img.shape[0] != 3 or img.shape[1] != 128 or img.shape[2] != 128:
-                        print(f"{img_file} had an invalid invalid image shape: {img.shape}")
+                        print(
+                            f"{img_file} had an invalid invalid image shape: {img.shape}"
+                        )
                         img = transforms.functional.resize(img, [128, 128])
-                    #NOTE: I currently left the actual data as uint8 to save memory, but we might want to convert it to float later
+                    # NOTE: I currently left the actual data as uint8 to save memory, but we might want to convert it to float later
                     data.append(img)
                     labels.append(target.clone())
                 else:
-                    print(f"Skipping file {img_file} due to invalid name: {img_file.name}")
+                    print(
+                        f"Skipping file {img_file} due to invalid name: {img_file.name}"
+                    )
     images_tensor = torch.stack(data)
     labels_tensor = torch.stack(labels)
     perm = torch.randperm(len(images_tensor))
     images_tensor = images_tensor[perm]
     labels_tensor = labels_tensor[perm]
     return images_tensor, labels_tensor
+
+
+def split_norm(test_size=0.15, val_size=0.15):
+    """load tensors, normalize features and return train, test, split"""
+    features_tensor, labels_tensor = load_data("aggregated")
+
+    features = features_tensor.numpy()
+    labels = labels_tensor.numpy()
+    # normalize features, each channel is from 0-255 so divide by 255 to get in the range of 0-1
+    features = features.astype(np.float32) / 255.0
+
+    class_indices = np.argmax(labels, axis=1)  # integer labels, just for stratification
+
+    X_temp, X_test, y_temp, y_test = train_test_split(
+        features, labels, test_size=test_size, random_state=SEED, stratify=class_indices
+    )
+
+    class_indices_temp = np.argmax(y_temp, axis=1)
+
+    X_train, X_val, y_train, y_val = train_test_split(
+        X_temp,
+        y_temp,
+        test_size=val_size,
+        random_state=SEED,
+        stratify=class_indices_temp,
+    )
+
+    print(f"X_train: {X_train.shape}, y_train: {y_train.shape}")
+    print(f"X_val:   {X_val.shape},   y_val:   {y_val.shape}")
+    print(f"X_test:  {X_test.shape},  y_test:  {y_test.shape}")
+
+    return X_train, X_val, X_test, y_train, y_val, y_test
