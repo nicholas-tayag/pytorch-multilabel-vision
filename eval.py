@@ -7,6 +7,8 @@ use the command:
 
 python eval.py --model_path YOUR_SAVED_MODEL --test_data project_test_data --group_id YOUR_GROUP_ID --project_title "YOUR_PROJECT_TITLE"
 
+python3.12 eval.py --model_path best_cnn_model.pth --test_data aggregated --group_id 13 --project_title "Multi-Label Object Recognition"
+
 Note that you need to write the model creation function and call it in the load_trained_model function. You may also
 need to change the predict function (e.g., if your pipeline is not compatible with the provided implementation).
 Please test the model creation function and the model loading function and predict function to make sure they work. If we cannot load or evaluate your model, we will apply a penalty.
@@ -140,7 +142,18 @@ def load_trained_model(model_path, num_labels, device, image_size):
     return model
 
 
-def predict(model, x, threshold=0.5):
+def load_thresholds(thresholds_path, num_labels, device):
+    if thresholds_path is None:
+        return None
+    p = Path(thresholds_path)
+    if not p.exists():
+        return None
+    t = torch.load(p, map_location=device)
+    if isinstance(t, torch.Tensor) and t.numel() == num_labels:
+        return t.view(-1).to(device)
+    return None
+
+def predict(model, x, threshold=0.5, thresholds=None, top_k=0):
     """
     Computes the predicted labels for a batch of input images.
 
@@ -148,6 +161,8 @@ def predict(model, x, threshold=0.5):
         model: Your trained model
         x (torch.Tensor): Input batch of images.
         threshold: used to get labels from probs
+        thresholds: per-class thresholds (optional)
+        top_k: force top-k labels per sample (optional)
 
     Returns:
         torch.Tensor: Predicted labels (for the given threshold).
@@ -160,11 +175,23 @@ def predict(model, x, threshold=0.5):
     with torch.no_grad():
         logits = model(x)
         probs = torch.sigmoid(logits)
-        preds = (probs >= threshold).float()
+        if thresholds is not None:
+            thr = thresholds.view(1, -1)
+            preds = (probs >= thr).float()
+        else:
+            preds = (probs >= threshold).float()
+
+        if top_k is not None and top_k > 0:
+            k = min(top_k, probs.shape[1])
+            topk_idx = torch.topk(probs, k=k, dim=1).indices
+            topk_mask = torch.zeros_like(probs)
+            topk_mask.scatter_(1, topk_idx, 1.0)
+            preds = torch.max(preds, topk_mask)
+
     return preds, probs, logits     # the code needs to return all of this for evaluate_model() to work!
 
 
-def evaluate_model(model, test_loader, device, threshold=0.5):
+def evaluate_model(model, test_loader, device, threshold=0.5, thresholds=None, top_k=0):
     """
     Evaluates the model on the test dataset.
 
@@ -189,7 +216,7 @@ def evaluate_model(model, test_loader, device, threshold=0.5):
             images, labels = images.to(device), labels.to(device)
 
             # call predict()
-            preds, probs, logits = predict(model, images, threshold=threshold)
+            preds, probs, logits = predict(model, images, threshold=threshold, thresholds=thresholds, top_k=top_k)
 
             # compute loss
             loss = criterion(logits, labels)
@@ -245,6 +272,8 @@ if __name__ == "__main__":
     parser.add_argument("--num_workers", type=int, default=1, help="Number of workers for DataLoader")
     parser.add_argument("--image_size", type=int, default=128, help="Input image size")
     parser.add_argument("--threshold", type=float, default=0.5, help="Threshold for eval")
+    parser.add_argument("--thresholds_path", type=str, default=None, help="Path to per-class thresholds (optional)")
+    parser.add_argument("--top_k", type=int, default=0, help="Force top-k labels per sample (optional)")
     parser.add_argument("--group_id", type=int, required=True, help="Project Group ID (non-negative integer)")
     parser.add_argument("--project_title", type=str, required=True, help="Project Title (at least 4 characters)")
 
@@ -274,12 +303,27 @@ if __name__ == "__main__":
     num_classes = len(test_loader.dataset.classes)
     print("Number of classes:", num_classes)
 
+    thresholds = None
+    if args.thresholds_path is not None:
+        thresholds = load_thresholds(args.thresholds_path, num_classes, device)
+    else:
+        candidate = Path(args.model_path).with_name("cnn_thresholds.pt")
+        if candidate.exists():
+            thresholds = load_thresholds(str(candidate), num_classes, device)
+
     # Load the trained model from the given checkpoint.
     model = load_trained_model(args.model_path, num_classes, device, args.image_size)
     print("Model loaded successfully from:", args.model_path)
 
     # Evaluate the model on test data.
-    test_metrics = evaluate_model(model, test_loader, device, threshold=args.threshold)
+    test_metrics = evaluate_model(
+        model,
+        test_loader,
+        device,
+        threshold=args.threshold,
+        thresholds=thresholds,
+        top_k=args.top_k
+    )
     print(f"Metrics: {test_metrics}")
 
     # Elapsed time.
