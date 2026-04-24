@@ -1,2 +1,4 @@
 .venv/
 aggregated/
+checkpoints/
+torch_cache/

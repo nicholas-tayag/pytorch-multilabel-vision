@@ -34,6 +34,12 @@ VALID_LABELS = set(LABEL_ORDER)
 LABEL_TO_IDX = {label: i for i, label in enumerate(LABEL_ORDER)}
 IMG_RE = re.compile(r"^img(\S+)\.png$", re.IGNORECASE)
 
+def parse_model_paths(model_path):
+    paths = [p.strip() for p in model_path.split(",") if p.strip()]
+    if not paths:
+        raise ValueError("No valid model paths provided.")
+    return paths
+
 ######### Classes ##########
 
 class CustomDirectoryLayoutDataset(Dataset):
@@ -118,28 +124,31 @@ def load_trained_model(model_path, num_labels, device, image_size):
     the given number of classes, and loads the trained model weights from a local file.
 
     Args:
-        model_path (str): Path to the trained model checkpoint.
+        model_path (str or list): Path(s) to the trained model checkpoint(s).
         num_labels (int): Number of output labels. (Should be 12 but left for consistency.)
         device (str): Device for model loading ('cuda' or 'cpu').
         image_size (int): desired input image size. (Not used here but kept for consistency.)
 
     Returns:
-        model: The model loaded on device. (If you are not using pytorch nn.Module directly, it is fine but make sure what it loads is compatible with the rest of the code.)
+        model: The model loaded on device. If multiple paths are provided, returns a list of models.
     """
 
-    model = build_model(num_labels=num_labels)
+    model_paths = model_path if isinstance(model_path, (list, tuple)) else [model_path]
+    models_list = []
 
-    ## Change/rewrite the rest of the function as needed, but make sure what it outputs works with the other functions (e.g., predict)
+    for path in model_paths:
+        model = build_model(num_labels=num_labels)
 
-    # Load local state dictionary
-    state_dict = torch.load(model_path, map_location=device)
-    model.load_state_dict(state_dict)
+        # Load local state dictionary
+        state_dict = torch.load(path, map_location=device)
+        model.load_state_dict(state_dict)
 
-    # Move the model to the specified device and set evaluation mode.
-    model = model.to(device)
-    model.eval()
+        # Move the model to the specified device and set evaluation mode.
+        model = model.to(device)
+        model.eval()
+        models_list.append(model)
 
-    return model
+    return models_list if len(models_list) > 1 else models_list[0]
 
 
 def load_thresholds(thresholds_path, num_labels, device):
@@ -173,7 +182,12 @@ def predict(model, x, threshold=0.5, thresholds=None, top_k=0):
     ## Change/rewrite the function as needed, but make sure it outputs predictions in a way that it works with the rest of the code
     ## the code below assumes your model outputs logits, change it if needed...
     with torch.no_grad():
-        logits = model(x)
+        if isinstance(model, (list, tuple)):
+            logits_list = [m(x) for m in model]
+            logits = torch.stack(logits_list, dim=0).mean(dim=0)
+        else:
+            logits = model(x)
+
         probs = torch.sigmoid(logits)
         if thresholds is not None:
             thr = thresholds.view(1, -1)
@@ -281,6 +295,7 @@ if __name__ == "__main__":
 
     project_group_id = args.group_id
     project_title = args.project_title
+    model_paths = parse_model_paths(args.model_path)
 
     # Validate required parameters.
     assert project_group_id >= 0, "Group ID must be non-negative"
@@ -307,13 +322,13 @@ if __name__ == "__main__":
     if args.thresholds_path is not None:
         thresholds = load_thresholds(args.thresholds_path, num_classes, device)
     else:
-        candidate = Path(args.model_path).with_name("cnn_thresholds.pt")
+        candidate = Path(model_paths[0]).with_name("cnn_thresholds.pt")
         if candidate.exists():
             thresholds = load_thresholds(str(candidate), num_classes, device)
 
     # Load the trained model from the given checkpoint.
-    model = load_trained_model(args.model_path, num_classes, device, args.image_size)
-    print("Model loaded successfully from:", args.model_path)
+    model = load_trained_model(model_paths, num_classes, device, args.image_size)
+    print("Model loaded successfully from:", ", ".join(model_paths))
 
     # Evaluate the model on test data.
     test_metrics = evaluate_model(

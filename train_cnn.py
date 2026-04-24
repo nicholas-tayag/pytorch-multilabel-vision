@@ -3,6 +3,8 @@ import contextlib
 import math
 import os
 
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 import torch
@@ -11,7 +13,22 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from torchvision import transforms, models
 
+
 from load_data import load_data
+
+LOCAL_TORCH_HOME = os.path.join(os.path.dirname(__file__), "torch_cache")
+OUTPUT_DIR = os.path.dirname(__file__)
+os.environ.setdefault("TORCH_HOME", LOCAL_TORCH_HOME)
+
+def ensure_pretrained_weights():
+    try:
+        _ = models.ResNet18_Weights.DEFAULT.get_state_dict(progress=False)
+    except Exception as exc:
+        raise RuntimeError(
+            "Pretrained weights not found in local cache. "
+            f"Set TORCH_HOME to {LOCAL_TORCH_HOME} and run: "
+            "python -c \"from torchvision import models; models.resnet18(weights=models.ResNet18_Weights.DEFAULT)\""
+        ) from exc
 
 LABELS = ["pen", "paper", "book", "clock", "phone", "laptop", "chair", "desk", "bottle", "keychain", "backpack", "calculator"]
 
@@ -33,9 +50,15 @@ class TensorSet(Dataset):
             x = self.tfm(x)
         return x, y
 
-def build_model(num_labels=12):
-    m = models.resnet18(weights=None)
-    m.fc = nn.Linear(m.fc.in_features, num_labels)
+def build_model(num_labels=12, dropout=0.1, use_pretrained=True):
+    if use_pretrained:
+        ensure_pretrained_weights()
+    weights = models.ResNet18_Weights.DEFAULT if use_pretrained else None
+    m = models.resnet18(weights=weights)
+    m.fc = nn.Sequential(
+        nn.Dropout(p=dropout),
+        nn.Linear(m.fc.in_features, num_labels),
+    )
     return m
 
 class FocalLoss(nn.Module):
@@ -52,6 +75,43 @@ class FocalLoss(nn.Module):
         p_t = probs * targets + (1 - probs) * (1 - targets)
         loss = (1 - p_t) ** self.gamma * bce
         return loss.mean()
+
+def smooth_labels(targets, eps):
+    if eps <= 0:
+        return targets
+    return targets * (1 - eps) + 0.5 * eps
+
+class EMA:
+    def __init__(self, model, decay=0.999):
+        self.decay = decay
+        self.shadow = {
+            name: p.detach().clone()
+            for name, p in model.named_parameters()
+            if p.requires_grad
+        }
+        self.backup = {}
+
+    def update(self, model):
+        for name, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            self.shadow[name].mul_(self.decay).add_(p.detach(), alpha=1 - self.decay)
+
+    def apply_to(self, model):
+        self.backup = {}
+        for name, p in model.named_parameters():
+            if name in self.shadow:
+                self.backup[name] = p.detach().clone()
+                p.data.copy_(self.shadow[name])
+
+    def restore(self, model):
+        for name, p in model.named_parameters():
+            if name in self.backup:
+                p.data.copy_(self.backup[name])
+        self.backup = {}
+
+    def state_dict(self):
+        return {k: v.clone() for k, v in self.shadow.items()}
 
 def multilabel_train_val_split(y, val_frac=0.15, seed=42):
     n = y.shape[0]
@@ -100,6 +160,34 @@ def load_checkpoint(path, device):
         return torch.load(path, map_location=device)
     except Exception:
         return None
+
+def average_state_dicts(paths, device):
+    if not paths:
+        return None
+    avg_state = {}
+    count = 0
+    for p in paths:
+        if not os.path.exists(p):
+            continue
+        state = torch.load(p, map_location=device)
+        if isinstance(state, dict) and "model_state" in state:
+            state = state["model_state"]
+        if not isinstance(state, dict):
+            continue
+        if count == 0:
+            for k, v in state.items():
+                avg_state[k] = v.clone().to(device) if torch.is_floating_point(v) else v.clone()
+        else:
+            for k, v in state.items():
+                if torch.is_floating_point(v):
+                    avg_state[k] += v.to(device)
+        count += 1
+    if count == 0:
+        return None
+    for k, v in avg_state.items():
+        if torch.is_floating_point(v):
+            avg_state[k] = v / count
+    return avg_state
 
 def evaluate_epoch(model, loader, device, loss_fn, threshold=0.5):
     model.eval()
@@ -154,12 +242,15 @@ def find_thresholds(model, loader, device, num_labels):
     probs = torch.cat(probs_all, dim=0)
     labels = torch.cat(labels_all, dim=0)
     thresholds = torch.zeros(num_labels)
-    grid = torch.linspace(0.05, 0.95, 19)
+
+    coarse_grid = torch.linspace(0.05, 0.95, 37)
+
     for c in range(num_labels):
         best_t = 0.5
         best_f1 = -1.0
         y_true = labels[:, c]
-        for t in grid:
+
+        for t in coarse_grid:
             y_pred = (probs[:, c] >= t).float()
             tp = ((y_pred == 1) & (y_true == 1)).sum().float()
             fp = ((y_pred == 1) & (y_true == 0)).sum().float()
@@ -168,7 +259,23 @@ def find_thresholds(model, loader, device, num_labels):
             if f1 > best_f1:
                 best_f1 = f1
                 best_t = t
+
+        fine_low = max(0.01, best_t - 0.05)
+        fine_high = min(0.99, best_t + 0.05)
+        fine_grid = torch.linspace(fine_low, fine_high, 21)
+
+        for t in fine_grid:
+            y_pred = (probs[:, c] >= t).float()
+            tp = ((y_pred == 1) & (y_true == 1)).sum().float()
+            fp = ((y_pred == 1) & (y_true == 0)).sum().float()
+            fn = ((y_pred == 0) & (y_true == 1)).sum().float()
+            f1 = 2 * tp / (2 * tp + fp + fn + 1e-8)
+            if f1 > best_f1:
+                best_f1 = f1
+                best_t = t
+
         thresholds[c] = best_t
+
     return thresholds
 
 def main():
@@ -179,17 +286,25 @@ def main():
     x_all = x_all.float() / 255.0
 
     image_size = 128
-    use_focal = True
+    use_focal = False
     focal_gamma = 2.0
     base_lr = 3e-4
-    weight_decay = 5e-4
+    weight_decay = 2e-3
     warmup_epochs = 2
-    num_epochs = 80
+    num_epochs = 50
     batch_size = 32
-    checkpoint_metric = "macro_f1"
+    dropout = 0.2
+    use_pretrained = True
+    use_weighted_sampler = False
+    freeze_epochs = 5
+    label_smoothing = 0.0
+    use_ema_eval = False
+    ema_decay = 0.999
+    top_k_ensemble = 3
+    checkpoint_metric = "val_loss"
     checkpoint_dir = "checkpoints"
     checkpoint_every = 5
-    early_stop_patience = 10
+    early_stop_patience = 5
     resume_from = None
     pin_memory = torch.cuda.is_available()
 
@@ -199,7 +314,7 @@ def main():
     std = [0.229, 0.224, 0.225]
 
     train_tfm = transforms.Compose([
-        transforms.RandomResizedCrop(image_size, scale=(0.8, 1.0)),
+        transforms.RandomResizedCrop(image_size, scale=(0.8, 1.0), ratio=(0.9, 1.1)),
         transforms.RandomHorizontalFlip(),
         transforms.RandomRotation(7),
         transforms.ColorJitter(0.15, 0.15, 0.15, 0.1),
@@ -225,14 +340,22 @@ def main():
         key = tuple(row.tolist())
         weights.append(1.0 / combo_counts[key])
 
-    sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
-
-    tr_loader = DataLoader(tr_ds, batch_size=batch_size, sampler=sampler, shuffle=False, num_workers=2, pin_memory=pin_memory)
+    if use_weighted_sampler:
+        sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
+        tr_loader = DataLoader(tr_ds, batch_size=batch_size, sampler=sampler, shuffle=False, num_workers=2, pin_memory=pin_memory)
+    else:
+        sampler = None
+        tr_loader = DataLoader(tr_ds, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=pin_memory)
     va_loader = DataLoader(va_ds, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=pin_memory)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    model = build_model(num_labels=len(LABELS)).to(device)
+    model = build_model(num_labels=len(LABELS), dropout=dropout, use_pretrained=use_pretrained).to(device)
+    ema = EMA(model, decay=ema_decay) if use_ema_eval else None
+    if freeze_epochs and freeze_epochs > 0:
+        for name, param in model.named_parameters():
+            if not name.startswith("fc."):
+                param.requires_grad = False
 
     y_train = y_all[train_idx]
     pos = y_train.sum(dim=0)
@@ -261,6 +384,7 @@ def main():
     best_metric_value = None
     best_epoch = -1
     epochs_since_improve = 0
+    best_model_paths = []
 
     if resume_from is not None and os.path.exists(resume_from):
         ckpt = load_checkpoint(resume_from, device)
@@ -286,6 +410,9 @@ def main():
     per_class_f1_hist = []
 
     for epoch in range(start_epoch, num_epochs):
+        if freeze_epochs and epoch == freeze_epochs:
+            for param in model.parameters():
+                param.requires_grad = True
         model.train()
         train_loss = 0.0
         train_n = 0
@@ -293,19 +420,26 @@ def main():
         for x, y in tr_loader:
             x, y = x.to(device), y.to(device)
             opt.zero_grad()
+            y_train_batch = smooth_labels(y, label_smoothing)
             out = model(x)
-            loss = loss_fn(out, y)
+            loss = loss_fn(out, y_train_batch)
             loss.backward()
             opt.step()
+            if ema is not None:
+                ema.update(model)
 
             train_loss += loss.item() * x.size(0)
             train_n += x.size(0)
 
         train_loss = train_loss / max(1, train_n)
 
+        if ema is not None:
+            ema.apply_to(model)
         val_loss, per_class_acc, per_class_prec, per_class_rec, per_class_f1, exact_match, hamming, macro_f1 = evaluate_epoch(
             model, va_loader, device, loss_fn, threshold=0.5
         )
+        if ema is not None:
+            ema.restore(model)
 
         scheduler.step()
 
@@ -337,7 +471,19 @@ def main():
             best_metric_value = display_metric
             best_epoch = epoch + 1
             epochs_since_improve = 0
-            torch.save(model.state_dict(), "best_cnn_model.pth")
+            best_state = ema.state_dict() if ema is not None else model.state_dict()
+            torch.save(best_state, "best_cnn_model.pth")
+
+            snapshot_path = os.path.join(checkpoint_dir, f"best_epoch_{epoch + 1}.pth")
+            torch.save(best_state, snapshot_path)
+            best_model_paths.append((current_metric, snapshot_path))
+            best_model_paths.sort(key=lambda x: x[0], reverse=True)
+            if len(best_model_paths) > top_k_ensemble:
+                for _, old_path in best_model_paths[top_k_ensemble:]:
+                    if os.path.exists(old_path):
+                        os.remove(old_path)
+                best_model_paths = best_model_paths[:top_k_ensemble]
+
             save_checkpoint(
                 model,
                 opt,
@@ -404,7 +550,8 @@ def main():
     plt.title("loss curves")
     plt.legend()
     plt.tight_layout()
-    plt.savefig("loss_curves.png")
+    out_path = os.path.join(OUTPUT_DIR, "loss_curves.png")
+    plt.savefig(out_path)
     plt.close()
 
     plt.figure(figsize=(7, 5))
@@ -415,7 +562,8 @@ def main():
     plt.title("multi-label accuracy")
     plt.legend()
     plt.tight_layout()
-    plt.savefig("multilabel_accuracy.png")
+    out_path = os.path.join(OUTPUT_DIR, "multilabel_accuracy.png")
+    plt.savefig(out_path)
     plt.close()
 
     plt.figure(figsize=(7, 5))
@@ -425,7 +573,8 @@ def main():
     plt.title("macro f1")
     plt.legend()
     plt.tight_layout()
-    plt.savefig("macro_f1.png")
+    out_path = os.path.join(OUTPUT_DIR, "macro_f1.png")
+    plt.savefig(out_path)
     plt.close()
 
     per_class_matrix = torch.stack(per_class_acc_hist, dim=0).numpy()
@@ -437,7 +586,8 @@ def main():
     plt.title("per-class accuracy")
     plt.legend(ncol=3, fontsize=8)
     plt.tight_layout()
-    plt.savefig("per_class_accuracy.png")
+    out_path = os.path.join(OUTPUT_DIR, "per_class_accuracy.png")
+    plt.savefig(out_path)
     plt.close()
 
 
@@ -451,7 +601,8 @@ def main():
     plt.title("per-class f1")
     plt.legend(ncol=3, fontsize=8)
     plt.tight_layout()
-    plt.savefig("per_class_f1.png")
+    out_path = os.path.join(OUTPUT_DIR, "per_class_f1.png")
+    plt.savefig(out_path)
     plt.close()
 
     final_per_class = per_class_acc_hist[-1]
@@ -464,7 +615,24 @@ def main():
     for i, label in enumerate(LABELS):
         print(f"  {label}: {final_per_class_f1[i].item():.4f}")
 
+    if ema is not None:
+        ema.apply_to(model)
     thresholds = find_thresholds(model, va_loader, device, len(LABELS))
+    if ema is not None:
+        ema.restore(model)
+        torch.save(ema.state_dict(), "ema_model.pth")
+        print("ema_model.pth")
+
+    print("per-class thresholds:")
+    for i, label in enumerate(LABELS):
+        print(f"  {label}: {thresholds[i].item():.4f}")
+
+    if top_k_ensemble is not None and top_k_ensemble > 1 and len(best_model_paths) > 1:
+        ensemble_paths = [p for _, p in best_model_paths]
+        avg_state = average_state_dicts(ensemble_paths, device)
+        if avg_state is not None:
+            torch.save(avg_state, "ensemble_model.pth")
+            print("ensemble_model.pth")
 
     torch.save(model.state_dict(), "cnn_model.pth")
     torch.save(thresholds, "cnn_thresholds.pt")
