@@ -5,7 +5,7 @@
 This file contains the evaluation code to load a trained model from a specified checkpoint, evaluate it on a test dataset, and report performance. We will run this script on the test dataset to evaluate the model's performance.
 use the command:
 
-python eval.py --model_path ensemble_model.pth --test_data project_test_data --group_id 13 --project_title "Multi-Label Object Recognition"
+python eval.py --model_path best_cnn_model.pth --test_data project_test_data --group_id 13 --project_title "Multi-Label Object Recognition"
 
 Note that you need to write the model creation function and call it in the load_trained_model function. You may also
 need to change the predict function (e.g., if your pipeline is not compatible with the provided implementation).
