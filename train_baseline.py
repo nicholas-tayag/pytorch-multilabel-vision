@@ -81,6 +81,16 @@ def multilabel_train_val_split(y, val_frac=0.15, seed=42):
     return train_idx, val_idx
 
 
+def split_train_val_test(y, test_frac=0.15, val_frac=0.15, seed=42):
+    remaining_idx, test_idx = multilabel_train_val_split(y, val_frac=test_frac, seed=seed)
+    y_remaining = y[remaining_idx]
+    adj_val_frac = val_frac / max(1e-8, (1.0 - test_frac))
+    train_idx_rel, val_idx_rel = multilabel_train_val_split(y_remaining, val_frac=adj_val_frac, seed=seed)
+    train_idx = remaining_idx[train_idx_rel]
+    val_idx = remaining_idx[val_idx_rel]
+    return train_idx, val_idx, test_idx
+
+
 def evaluate_epoch(model, loader, device, loss_fn, threshold=0.5):
     model.eval()
     total_loss = 0.0
@@ -135,7 +145,9 @@ def main():
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--val_frac", type=float, default=0.15)
+    parser.add_argument("--test_frac", type=float, default=0.15)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--split_path", type=str, default="baseline_split.pt")
     parser.add_argument("--save_path", type=str, default="baseline_resnet18_scratch.pth")
     args = parser.parse_args()
 
@@ -144,7 +156,22 @@ def main():
     x_all, y_all = load_data(args.data_dir)
     x_all = x_all.float() / 255.0
 
-    train_idx, val_idx = multilabel_train_val_split(y_all, val_frac=args.val_frac, seed=args.seed)
+    if args.split_path and os.path.exists(args.split_path):
+        split = torch.load(args.split_path, map_location="cpu")
+        train_idx = split["train_idx"]
+        val_idx = split["val_idx"]
+        test_idx = split["test_idx"]
+    else:
+        train_idx, val_idx, test_idx = split_train_val_test(
+            y_all, test_frac=args.test_frac, val_frac=args.val_frac, seed=args.seed
+        )
+        if args.split_path:
+            torch.save(
+                {"train_idx": train_idx, "val_idx": val_idx, "test_idx": test_idx},
+                args.split_path
+            )
+
+    print(f"train size: {len(train_idx)} | val size: {len(val_idx)} | test size: {len(test_idx)}")
 
     tfm = transforms.Normalize(mean=MEAN, std=STD)
     tr_ds = TensorSet(x_all, y_all, train_idx, tfm=tfm)

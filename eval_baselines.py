@@ -203,6 +203,7 @@ def main():
     parser.add_argument("--test_frac", type=float, default=0.15, help="test split fraction")
     parser.add_argument("--val_frac", type=float, default=0.15, help="val split fraction")
     parser.add_argument("--seed", type=int, default=42, help="seed")
+    parser.add_argument("--split_path", type=str, default="baseline_split.pt", help="shared split path")
     parser.add_argument("--batch_size", type=int, default=64, help="batch size for evaluation")
     parser.add_argument("--num_workers", type=int, default=2, help="DataLoader workers")
     parser.add_argument("--threshold", type=float, default=0.5, help="global threshold if no per-class thresholds")
@@ -219,9 +220,20 @@ def main():
     x_all, y_all = load_data(args.data_dir)
     x_all = x_all.float() / 255.0
 
-    train_idx, val_idx, test_idx = split_train_val_test(
-        y_all, test_frac=args.test_frac, val_frac=args.val_frac, seed=args.seed
-    )
+    if args.split_path and Path(args.split_path).exists():
+        split = torch.load(args.split_path, map_location="cpu")
+        train_idx = split["train_idx"]
+        val_idx = split["val_idx"]
+        test_idx = split["test_idx"]
+    else:
+        train_idx, val_idx, test_idx = split_train_val_test(
+            y_all, test_frac=args.test_frac, val_frac=args.val_frac, seed=args.seed
+        )
+        if args.split_path:
+            torch.save(
+                {"train_idx": train_idx, "val_idx": val_idx, "test_idx": test_idx},
+                args.split_path
+            )
 
     tfm = transforms.Normalize(mean=MEAN, std=STD)
     test_ds = TensorSet(x_all, y_all, test_idx, tfm=tfm)
@@ -244,7 +256,7 @@ def main():
         print("[info] loaded per-class thresholds from:", args.thresholds_path)
 
     baseline_metrics = eval_model_path(
-        args.baseline_model_path, test_loader, device, thresholds, args.threshold, "baseline", args.baseline_dropout
+        args.baseline_model_path, test_loader, device, None, args.threshold, "baseline", args.baseline_dropout
     )
     our_metrics = eval_model_path(
         args.our_model_path, test_loader, device, thresholds, args.threshold, "our", args.our_dropout
