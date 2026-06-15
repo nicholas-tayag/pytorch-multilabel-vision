@@ -3,7 +3,7 @@ name = "pytorch-multilabel-vision"
 version = "0.1.0"
 description = "PyTorch pipeline for multi-label object recognition with transfer learning and threshold tuning"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.11"
 dependencies = [
     "numpy>=2.4.4",
     "pandas>=3.0.2",
@@ -11,4 +11,28 @@ dependencies = [
     "torch>=2.11.0",
     "torchvision>=0.26.0",
     "matplotlib>=3.9.0",
+    "pillow>=11.0.0",
+    "pyyaml>=6.0.2",
 ]
+
+[project.optional-dependencies]
+demo = ["gradio>=5.0.0"]
+dev = ["pytest>=8.0.0", "ruff>=0.8.0"]
+
+[build-system]
+requires = ["setuptools>=75.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint.per-file-ignores]
+"scripts/*.py" = ["E402"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

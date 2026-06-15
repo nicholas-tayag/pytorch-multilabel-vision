@@ -1,0 +1,30 @@
+project:
+  name: VisionTagger
+  task: desk_inventory_multilabel_classification
+
+data:
+  train_dir: aggregated
+  test_dir: project_test_data
+  image_size: 128
+  val_frac: 0.15
+  test_frac: 0.15
+  seed: 42
+
+model:
+  architecture: resnet18
+  dropout: 0.2
+  pretrained: true
+
+training:
+  epochs: 50
+  batch_size: 32
+  learning_rate: 0.0003
+  weight_decay: 0.002
+  freeze_epochs: 5
+  early_stop_patience: 5
+  output_dir: runs/vision_tagger
+
+inference:
+  model_path: artifacts/best_cnn_model.pth
+  thresholds_path: artifacts/cnn_thresholds.pt
+  threshold: 0.5
