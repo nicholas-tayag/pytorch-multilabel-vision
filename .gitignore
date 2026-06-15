@@ -8,4 +8,5 @@ torch_cache/
 CAI6108_Final_Project/checkpoints/
 __pycache__/
 *.pyc
+*.egg-info/
 .DS_Store
