@@ -1,7 +1,7 @@
 [project]
-name = "cai6108-final-project"
+name = "pytorch-multilabel-vision"
 version = "0.1.0"
-description = "Add your description here"
+description = "PyTorch pipeline for multi-label object recognition with transfer learning and threshold tuning"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
